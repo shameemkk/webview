@@ -6,3 +6,6 @@ shots/
 *.txt
 !requirements.txt
 .env
+# cached Facebook session cookies — secret, never commit
+fb_state.json
+playwright_api.py

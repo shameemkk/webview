@@ -27,11 +27,18 @@ to get the raw base64 in the response instead of saving a file.
 A single Chrome instance is shared across requests; each request runs in its own
 isolated context with a fresh virtual identity + stealth patches. Built on aiohttp
 so it shares Playwright's asyncio event loop with no extra moving parts.
+
+Facebook login (optional):
+    Set FB_EMAIL and FB_PASSWORD in .env. When a requested facebook.com URL bounces
+    to the login wall, the server logs in once, caches the session cookies (in
+    FB_STATE_FILE, default ./fb_state.json) and reuses them on later requests, then
+    reloads the target page so you get the real content instead of the login form.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import time
 import uuid
@@ -61,6 +68,20 @@ SHOTS_DIR = os.environ.get("SHOTS_DIR") or os.path.join(_HERE, "shots")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 # Auto-delete screenshots older than this many hours (0 = keep forever).
 SHOTS_TTL_HOURS = float(os.environ.get("SHOTS_TTL_HOURS", "24"))
+
+# --------------------------------------------------------------------------- #
+# Facebook auto-login
+# Pages like https://www.facebook.com/<page> bounce anonymous visitors to a login
+# wall. Put FB_EMAIL / FB_PASSWORD in .env and we log in ONCE, cache the session
+# cookies (to FB_STATE_FILE + memory), and reuse them on later requests — logging
+# in every time would get the account checkpointed by Facebook.
+# Note: this uses YOUR credentials and must comply with Facebook's terms; accounts
+# with 2FA / login approvals can't be automated this way (the challenge will block).
+# --------------------------------------------------------------------------- #
+FB_EMAIL = os.environ.get("FB_EMAIL", "").strip()
+FB_PASSWORD = os.environ.get("FB_PASSWORD", "")
+FB_STATE_FILE = os.environ.get("FB_STATE_FILE") or os.path.join(_HERE, "fb_state.json")
+FB_LOGIN_ENABLED = bool(FB_EMAIL and FB_PASSWORD)
 
 
 def _as_bool(value, default: bool = True) -> bool:
@@ -114,6 +135,105 @@ async def _auto_scroll(page) -> None:
         pass
 
 
+# --------------------------------------------------------------------------- #
+# Facebook login helpers
+# --------------------------------------------------------------------------- #
+def _is_facebook_url(url: str) -> bool:
+    u = (url or "").lower()
+    return "facebook.com" in u or "fb.com" in u
+
+
+def _looks_like_login(url: str) -> bool:
+    """True when the current URL is Facebook's login / checkpoint wall."""
+    u = (url or "").lower()
+    return ("facebook.com/login" in u) or ("login/?next" in u) or ("/checkpoint" in u)
+
+
+def _load_fb_cookies() -> list:
+    try:
+        with open(FB_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("cookies", [])
+    except Exception:
+        return []
+
+
+def _save_fb_cookies(cookies: list) -> None:
+    try:
+        with open(FB_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"cookies": cookies}, f)
+    except Exception:
+        pass
+
+
+async def _do_facebook_login(page) -> bool:
+    """Fill in Facebook's login form. Returns True if a real session was created."""
+    try:
+        await page.goto("https://www.facebook.com/login/",
+                        wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    except Exception:
+        pass
+
+    # Dismiss the cookie-consent dialog if shown (varies by region).
+    for sel in ('[data-cookiebanner="accept_button"]',
+                'button[title="Allow all cookies"]',
+                'button[title="Accept all"]',
+                '[aria-label="Allow all cookies"]'):
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() and await btn.is_visible():
+                await btn.click(timeout=3000)
+                break
+        except Exception:
+            pass
+
+    try:
+        await page.fill('input[name="email"]', FB_EMAIL, timeout=15000)
+        await page.fill('input[name="pass"]', FB_PASSWORD, timeout=15000)
+        await page.click('button[name="login"]', timeout=15000)
+    except Exception:
+        return False
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+
+    # Success = a session cookie (c_user) exists and we're off the login wall.
+    try:
+        cookies = await page.context.cookies("https://www.facebook.com")
+    except Exception:
+        cookies = []
+    has_session = any(c.get("name") == "c_user" for c in cookies)
+    return has_session and not _looks_like_login(page.url)
+
+
+async def _ensure_facebook_login(app, context, page, target_url: str, seen_version: int) -> bool:
+    """Get past the login wall: try freshly-refreshed cookies first, else log in.
+    Serialized by a lock so concurrent Facebook requests don't all log in at once."""
+    async with app["fb_lock"]:
+        # Another request may have refreshed the session while we held the lock.
+        if app["fb_cookies_version"] != seen_version and app.get("fb_cookies"):
+            try:
+                await context.add_cookies(app["fb_cookies"])
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                if not _looks_like_login(page.url):
+                    return True
+            except Exception:
+                pass
+
+        if not await _do_facebook_login(page):
+            return False
+
+        try:
+            state = await context.storage_state()
+            app["fb_cookies"] = state.get("cookies", [])
+            app["fb_cookies_version"] += 1
+            _save_fb_cookies(app["fb_cookies"])
+        except Exception:
+            pass
+        return True
+
+
 async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool,
                   scroll: bool, screenshot: bool, inline: bool) -> dict:
     """Open the URL in a fresh stealth context and return text + screenshot."""
@@ -122,10 +242,26 @@ async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool
     sb: StealthBrowser = app["sb"]
     sem: asyncio.Semaphore = app["sem"]
 
+    is_fb = FB_LOGIN_ENABLED and _is_facebook_url(url)
+    fb_version = app.get("fb_cookies_version", 0)
+
     async with sem:
         context, page = await sb.new_identity_page()
         try:
+            # Reuse a cached Facebook session so we land on the real page, not login.
+            if is_fb and app.get("fb_cookies"):
+                try:
+                    await context.add_cookies(app["fb_cookies"])
+                except Exception:
+                    pass
+
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
+            # Bounced to the login wall? Log in (once, cached) and reload the target.
+            if is_fb and _looks_like_login(page.url):
+                if await _ensure_facebook_login(app, context, page, url, fb_version):
+                    resp = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
             if scroll:
                 await _auto_scroll(page)
 
@@ -231,6 +367,12 @@ async def _on_startup(app: web.Application) -> None:
     _prune_old_shots()
     app["sb"] = None
     app["sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
+    app["fb_lock"] = asyncio.Lock()
+    app["fb_cookies"] = _load_fb_cookies()
+    app["fb_cookies_version"] = 0
+    if FB_LOGIN_ENABLED:
+        print(f"[server] facebook auto-login enabled for {FB_EMAIL} "
+              f"(cached cookies: {len(app['fb_cookies'])})", flush=True)
 
     # Launch the browser in the background so the HTTP server binds the port
     # immediately. aiohttp runs on_startup BEFORE it starts listening, so doing a
