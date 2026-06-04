@@ -149,12 +149,43 @@ def _looks_like_login(url: str) -> bool:
     return ("facebook.com/login" in u) or ("login/?next" in u) or ("/checkpoint" in u)
 
 
-def _load_fb_cookies() -> list:
+def _parse_cookies(raw: str) -> list:
+    """Accept either {"cookies": [...]} or a bare [...] list of cookies."""
     try:
-        with open(FB_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f).get("cookies", [])
+        data = json.loads(raw)
     except Exception:
         return []
+    if isinstance(data, dict):
+        return data.get("cookies", [])
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _load_fb_cookies() -> list:
+    """Load a reusable Facebook session from (in order): the state file, a base64
+    env var, or a raw-JSON env var. The env vars are handy on PaaS hosts where you
+    can't easily upload a file — paste the session next to FB_EMAIL/FB_PASSWORD."""
+    # 1) session file written by fb_login.py or a prior in-process login
+    try:
+        with open(FB_STATE_FILE, "r", encoding="utf-8") as f:
+            cookies = json.load(f).get("cookies", [])
+            if cookies:
+                return cookies
+    except Exception:
+        pass
+    # 2) base64 of the whole fb_state.json (safest for env vars — no quoting issues)
+    b64 = os.environ.get("FB_STATE_B64", "").strip()
+    if b64:
+        try:
+            return _parse_cookies(base64.b64decode(b64).decode("utf-8"))
+        except Exception:
+            pass
+    # 3) raw JSON in an env var
+    raw = os.environ.get("FB_STATE_JSON", "").strip()
+    if raw:
+        return _parse_cookies(raw)
+    return []
 
 
 def _save_fb_cookies(cookies: list) -> None:
@@ -165,51 +196,104 @@ def _save_fb_cookies(cookies: list) -> None:
         pass
 
 
-async def _do_facebook_login(page) -> bool:
-    """Fill in Facebook's login form. Returns True if a real session was created."""
+async def _save_debug_shot(page) -> Optional[str]:
+    """Save a full-page screenshot of the current (failed-login) page for debugging."""
     try:
-        await page.goto("https://www.facebook.com/login/",
-                        wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        filename = f"fb_login_{uuid.uuid4().hex}.png"
+        await page.screenshot(path=os.path.join(SHOTS_DIR, filename), full_page=True)
+        return filename
     except Exception:
-        pass
+        return None
 
-    # Dismiss the cookie-consent dialog if shown (varies by region).
+
+async def _dismiss_consent(page) -> None:
+    """Click through Facebook's cookie-consent dialog if one is shown (varies by region)."""
     for sel in ('[data-cookiebanner="accept_button"]',
+                '[data-testid="cookie-policy-manage-dialog-accept-button"]',
                 'button[title="Allow all cookies"]',
                 'button[title="Accept all"]',
-                '[aria-label="Allow all cookies"]'):
+                '[aria-label="Allow all cookies"]',
+                '[aria-label="Accept all"]'):
         try:
             btn = page.locator(sel).first
             if await btn.count() and await btn.is_visible():
                 await btn.click(timeout=3000)
-                break
+                await page.wait_for_timeout(500)
+                return
         except Exception:
             pass
 
+
+async def _do_facebook_login(page) -> tuple:
+    """Fill in Facebook's login form. Returns (ok, detail, debug_file).
+    On failure, detail says why and debug_file is a screenshot of what FB showed."""
     try:
-        await page.fill('input[name="email"]', FB_EMAIL, timeout=15000)
-        await page.fill('input[name="pass"]', FB_PASSWORD, timeout=15000)
-        await page.click('button[name="login"]', timeout=15000)
+        await page.goto("https://www.facebook.com/login/",
+                        wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    except Exception as e:
+        return False, f"could not open login page: {e}", None
+
+    await _dismiss_consent(page)
+
+    # The form must actually be present before we type into it.
+    try:
+        await page.wait_for_selector('input[name="email"]', timeout=15000)
     except Exception:
-        return False
+        title = await page.title()
+        return (False, f"login form not found (title={title!r}) — likely a consent "
+                f"wall, captcha or block page", await _save_debug_shot(page))
+
+    try:
+        await page.fill('input[name="email"]', FB_EMAIL, timeout=10000)
+        await page.fill('input[name="pass"]', FB_PASSWORD, timeout=10000)
+    except Exception as e:
+        return False, f"could not fill credentials: {e}", await _save_debug_shot(page)
+
+    # Submit (button if present, otherwise Enter in the password field).
+    try:
+        await page.click('button[name="login"]', timeout=8000)
+    except Exception:
+        try:
+            await page.press('input[name="pass"]', "Enter")
+        except Exception as e:
+            return False, f"could not submit form: {e}", await _save_debug_shot(page)
 
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
 
-    # Success = a session cookie (c_user) exists and we're off the login wall.
+    url = page.url
     try:
         cookies = await page.context.cookies("https://www.facebook.com")
     except Exception:
         cookies = []
-    has_session = any(c.get("name") == "c_user" for c in cookies)
-    return has_session and not _looks_like_login(page.url)
+    if any(c.get("name") == "c_user" for c in cookies) and not _looks_like_login(url):
+        return True, "logged_in", None
+
+    # Classify the failure from URL + visible text so the response is actionable.
+    try:
+        body = (await page.evaluate("() => document.body ? document.body.innerText : ''") or "")
+    except Exception:
+        body = ""
+    low = body.lower()
+    if "checkpoint" in url.lower() or "two-factor" in low or "two factor" in low or \
+            "approve" in low or "enter the code" in low or "login code" in low:
+        reason = "blocked: 2FA / login approval required (cannot be automated)"
+    elif "captcha" in low or "security check" in low or "confirm your identity" in low:
+        reason = "blocked: captcha / security check (likely datacenter IP)"
+    elif "incorrect" in low or "wrong" in low or "didn't match" in low or \
+            "the password you" in low or "isn't connected to an account" in low:
+        reason = "wrong email/password"
+    else:
+        reason = f"still on login wall after submit (url={url})"
+    return False, reason, await _save_debug_shot(page)
 
 
-async def _ensure_facebook_login(app, context, page, target_url: str, seen_version: int) -> bool:
+async def _ensure_facebook_login(app, context, page, target_url: str, seen_version: int) -> tuple:
     """Get past the login wall: try freshly-refreshed cookies first, else log in.
-    Serialized by a lock so concurrent Facebook requests don't all log in at once."""
+    Returns (ok, detail, debug_file). Serialized by a lock so concurrent Facebook
+    requests don't all log in at once."""
     async with app["fb_lock"]:
         # Another request may have refreshed the session while we held the lock.
         if app["fb_cookies_version"] != seen_version and app.get("fb_cookies"):
@@ -217,12 +301,13 @@ async def _ensure_facebook_login(app, context, page, target_url: str, seen_versi
                 await context.add_cookies(app["fb_cookies"])
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 if not _looks_like_login(page.url):
-                    return True
+                    return True, "reused_session", None
             except Exception:
                 pass
 
-        if not await _do_facebook_login(page):
-            return False
+        ok, detail, debug_file = await _do_facebook_login(page)
+        if not ok:
+            return False, detail, debug_file
 
         try:
             state = await context.storage_state()
@@ -231,7 +316,7 @@ async def _ensure_facebook_login(app, context, page, target_url: str, seen_versi
             _save_fb_cookies(app["fb_cookies"])
         except Exception:
             pass
-        return True
+        return True, detail, debug_file
 
 
 async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool,
@@ -244,17 +329,22 @@ async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool
 
     is_fb = _is_facebook_url(url)
     fb_version = app.get("fb_cookies_version", 0)
+    had_cookies = bool(app.get("fb_cookies"))
+    have_creds = FB_LOGIN_ENABLED
     # login status is reported back so you can see what happened.
     login_status = None
+    login_detail = None
+    login_debug_url = None
     if is_fb:
-        login_status = "enabled" if FB_LOGIN_ENABLED else "disabled: set FB_EMAIL/FB_PASSWORD"
+        login_status = ("ready" if (had_cookies or have_creds)
+                        else "disabled: provide fb_state.json / FB_STATE_B64, or "
+                             "FB_EMAIL+FB_PASSWORD")
 
     async with sem:
         context, page = await sb.new_identity_page()
         try:
-            had_cookies = bool(app.get("fb_cookies"))
-            # Reuse a cached Facebook session so we land on the real page, not login.
-            if is_fb and FB_LOGIN_ENABLED and had_cookies:
+            # Reuse a cached session if we have one — works even without credentials.
+            if is_fb and had_cookies:
                 try:
                     await context.add_cookies(app["fb_cookies"])
                 except Exception:
@@ -262,15 +352,23 @@ async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool
 
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
 
-            if is_fb and FB_LOGIN_ENABLED:
+            if is_fb:
                 if _looks_like_login(page.url):
-                    # Bounced to the login wall? Log in (once, cached) and reload.
-                    ok = await _ensure_facebook_login(app, context, page, url, fb_version)
-                    if ok:
-                        resp = await page.goto(url, wait_until="domcontentloaded",
-                                               timeout=NAV_TIMEOUT_MS)
-                    login_status = ("logged_in" if ok and not _looks_like_login(page.url)
-                                    else "login_failed")
+                    if have_creds:
+                        # Bounced to the login wall? Log in (once, cached) and reload.
+                        ok, login_detail, debug_file = await _ensure_facebook_login(
+                            app, context, page, url, fb_version)
+                        if ok:
+                            resp = await page.goto(url, wait_until="domcontentloaded",
+                                                   timeout=NAV_TIMEOUT_MS)
+                        login_status = ("logged_in" if ok and not _looks_like_login(page.url)
+                                        else "login_failed")
+                        if debug_file:
+                            login_debug_url = f"{base_url}/shots/{debug_file}"
+                    else:
+                        login_status = "login_failed"
+                        login_detail = ("session missing/expired and no FB_EMAIL/"
+                                        "FB_PASSWORD set to log in — refresh the cookies")
                 else:
                     login_status = "reused_session" if had_cookies else "not_required"
 
@@ -286,6 +384,8 @@ async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool
                 "status": resp.status if resp else None,
                 "title": await page.title(),
                 "login": login_status,
+                "login_detail": login_detail,
+                "login_debug_url": login_debug_url,
                 "text": text,
                 "screenshot_url": None,
                 "screenshot_file": None,
@@ -383,9 +483,11 @@ async def _on_startup(app: web.Application) -> None:
     app["fb_lock"] = asyncio.Lock()
     app["fb_cookies"] = _load_fb_cookies()
     app["fb_cookies_version"] = 0
-    if FB_LOGIN_ENABLED:
-        print(f"[server] facebook auto-login enabled for {FB_EMAIL} "
-              f"(cached cookies: {len(app['fb_cookies'])})", flush=True)
+    n_cookies = len(app["fb_cookies"])
+    if FB_LOGIN_ENABLED or n_cookies:
+        who = FB_EMAIL if FB_LOGIN_ENABLED else "cookie-only (no creds)"
+        print(f"[server] facebook session ready: {who} "
+              f"(cached cookies: {n_cookies})", flush=True)
 
     # Launch the browser in the background so the HTTP server binds the port
     # immediately. aiohttp runs on_startup BEFORE it starts listening, so doing a
