@@ -242,14 +242,19 @@ async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool
     sb: StealthBrowser = app["sb"]
     sem: asyncio.Semaphore = app["sem"]
 
-    is_fb = FB_LOGIN_ENABLED and _is_facebook_url(url)
+    is_fb = _is_facebook_url(url)
     fb_version = app.get("fb_cookies_version", 0)
+    # login status is reported back so you can see what happened.
+    login_status = None
+    if is_fb:
+        login_status = "enabled" if FB_LOGIN_ENABLED else "disabled: set FB_EMAIL/FB_PASSWORD"
 
     async with sem:
         context, page = await sb.new_identity_page()
         try:
+            had_cookies = bool(app.get("fb_cookies"))
             # Reuse a cached Facebook session so we land on the real page, not login.
-            if is_fb and app.get("fb_cookies"):
+            if is_fb and FB_LOGIN_ENABLED and had_cookies:
                 try:
                     await context.add_cookies(app["fb_cookies"])
                 except Exception:
@@ -257,10 +262,17 @@ async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool
 
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
 
-            # Bounced to the login wall? Log in (once, cached) and reload the target.
-            if is_fb and _looks_like_login(page.url):
-                if await _ensure_facebook_login(app, context, page, url, fb_version):
-                    resp = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            if is_fb and FB_LOGIN_ENABLED:
+                if _looks_like_login(page.url):
+                    # Bounced to the login wall? Log in (once, cached) and reload.
+                    ok = await _ensure_facebook_login(app, context, page, url, fb_version)
+                    if ok:
+                        resp = await page.goto(url, wait_until="domcontentloaded",
+                                               timeout=NAV_TIMEOUT_MS)
+                    login_status = ("logged_in" if ok and not _looks_like_login(page.url)
+                                    else "login_failed")
+                else:
+                    login_status = "reused_session" if had_cookies else "not_required"
 
             if scroll:
                 await _auto_scroll(page)
@@ -273,6 +285,7 @@ async def _scrape(app: web.Application, base_url: str, url: str, full_page: bool
                 "final_url": page.url,
                 "status": resp.status if resp else None,
                 "title": await page.title(),
+                "login": login_status,
                 "text": text,
                 "screenshot_url": None,
                 "screenshot_file": None,
