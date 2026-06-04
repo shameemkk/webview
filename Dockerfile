@@ -15,7 +15,8 @@ COPY . .
 # Screenshots live here and are served at /shots; keep it writable.
 RUN mkdir -p /app/shots
 
-ENV HOST=0.0.0.0 \
+ENV PYTHONUNBUFFERED=1 \
+    HOST=0.0.0.0 \
     PORT=8080 \
     HEADLESS=true \
     NO_SANDBOX=true \

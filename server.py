@@ -166,6 +166,21 @@ def _base_url(request: web.Request) -> str:
     return PUBLIC_BASE_URL or f"{request.scheme}://{request.host}"
 
 
+async def index(request: web.Request) -> web.Response:
+    """Root landing route so the domain root doesn't 404 — shows usage."""
+    base = _base_url(request)
+    return web.json_response({
+        "service": "stealth-scrape-api",
+        "status": "ok",
+        "endpoints": {
+            "health": f"{base}/health",
+            "scrape_get": f"{base}/scrape?url=https://example.com",
+            "scrape_post": f"{base}/scrape  (JSON body: {{\"url\": \"https://example.com\"}})",
+            "shots": f"{base}/shots/<file>.png",
+        },
+    })
+
+
 async def health(request: web.Request) -> web.Response:
     sb: Optional[StealthBrowser] = request.app.get("sb")
     return web.json_response(
@@ -185,6 +200,12 @@ async def scrape(request: web.Request) -> web.Response:
     url = (data.get("url") or "").strip()
     if not url:
         return web.json_response({"success": False, "error": "missing 'url'"}, status=400)
+
+    if request.app.get("sb") is None:
+        return web.json_response(
+            {"success": False, "error": "browser still starting, retry in a moment"},
+            status=503,
+        )
 
     full_page = _as_bool(data.get("full_page", True))
     scroll = _as_bool(data.get("scroll", True))
@@ -208,19 +229,36 @@ async def scrape(request: web.Request) -> web.Response:
 async def _on_startup(app: web.Application) -> None:
     os.makedirs(SHOTS_DIR, exist_ok=True)
     _prune_old_shots()
-    sb = StealthBrowser(headless=HEADLESS, prefer_chrome=PREFER_CHROME)
-    await sb.launch()
-    app["sb"] = sb
+    app["sb"] = None
     app["sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
-    print(f"[server] browser ready ({sb.channel or 'bundled chromium'}), "
-          f"concurrency={MAX_CONCURRENCY}, shots -> {SHOTS_DIR}")
+
+    # Launch the browser in the background so the HTTP server binds the port
+    # immediately. aiohttp runs on_startup BEFORE it starts listening, so doing a
+    # slow/failing Chromium launch here would block the port from ever opening
+    # (the container looks "up" but nothing answers -> proxy 404). This way
+    # /health responds right away and any launch error is logged loudly.
+    async def _launch_browser() -> None:
+        try:
+            sb = StealthBrowser(headless=HEADLESS, prefer_chrome=PREFER_CHROME)
+            await sb.launch()
+            app["sb"] = sb
+            print(f"[server] browser ready ({sb.channel or 'bundled chromium'}), "
+                  f"concurrency={MAX_CONCURRENCY}, shots -> {SHOTS_DIR}", flush=True)
+        except Exception as e:
+            print(f"[server] BROWSER LAUNCH FAILED: {e!r}", flush=True)
+
+    app["browser_task"] = asyncio.create_task(_launch_browser())
+    print(f"[server] HTTP server listening on {HOST}:{PORT}", flush=True)
 
 
 async def _on_cleanup(app: web.Application) -> None:
+    task: Optional[asyncio.Task] = app.get("browser_task")
+    if task and not task.done():
+        task.cancel()
     sb: Optional[StealthBrowser] = app.get("sb")
     if sb:
         await sb.close()
-    print("[server] browser closed")
+    print("[server] browser closed", flush=True)
 
 
 def make_app() -> web.Application:
@@ -229,6 +267,7 @@ def make_app() -> web.Application:
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.add_routes([
+        web.get("/", index),
         web.get("/health", health),
         web.get("/scrape", scrape),
         web.post("/scrape", scrape),
